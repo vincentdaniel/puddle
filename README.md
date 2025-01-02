@@ -1,4 +1,4 @@
-[![Go Reference](https://pkg.go.dev/badge/github.com/jackc/puddle/v2.svg)](https://pkg.go.dev/github.com/jackc/puddle/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/vincentdaniel/puddle/v2.svg)](https://pkg.go.dev/github.com/vincentdaniel/puddle/v2)
 ![Build Status](https://github.com/jackc/puddle/actions/workflows/ci.yml/badge.svg)
 
 # Puddle
@@ -29,7 +29,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/jackc/puddle/v2"
+	"github.com/vincentdaniel/puddle/v2"
 )
 
 func main() {

@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/puddle/v2/internal/genstack"
+	"github.com/vincentdaniel/puddle/v2/internal/genstack"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -17,6 +17,10 @@ const (
 	resourceStatusAcquired     = iota
 	resourceStatusHijacked     = iota
 )
+
+type CtxKey string
+
+const PoolKey CtxKey = "PoolKey"
 
 // ErrClosedPool occurs on an attempt to acquire a connection from a closed pool
 // or a pool that is closed while the acquire is waiting.
@@ -51,38 +55,38 @@ func (res *Resource[T]) Value() T {
 }
 
 // Release returns the resource to the pool. res must not be subsequently used.
-func (res *Resource[T]) Release() {
+func (res *Resource[T]) Release(ctx context.Context) {
 	if res.status != resourceStatusAcquired {
 		panic("tried to release resource that is not acquired")
 	}
-	res.pool.releaseAcquiredResource(res, nanotime())
+	res.pool.releaseAcquiredResource(ctx, res, nanotime())
 }
 
-// ReleaseUnused returns the resource to the pool without updating when it was last used used. i.e. LastUsedNanotime
+// ReleaseUnused returns the resource to the pool without updating when it was last used. i.e. LastUsedNanotime
 // will not change. res must not be subsequently used.
-func (res *Resource[T]) ReleaseUnused() {
+func (res *Resource[T]) ReleaseUnused(ctx context.Context) {
 	if res.status != resourceStatusAcquired {
 		panic("tried to release resource that is not acquired")
 	}
-	res.pool.releaseAcquiredResource(res, res.lastUsedNano)
+	res.pool.releaseAcquiredResource(ctx, res, res.lastUsedNano)
 }
 
 // Destroy returns the resource to the pool for destruction. res must not be
 // subsequently used.
-func (res *Resource[T]) Destroy() {
+func (res *Resource[T]) Destroy(ctx context.Context) {
 	if res.status != resourceStatusAcquired {
 		panic("tried to destroy resource that is not acquired")
 	}
-	go res.pool.destroyAcquiredResource(res)
+	go res.pool.destroyAcquiredResource(ctx, res)
 }
 
 // Hijack assumes ownership of the resource from the pool. Caller is responsible
 // for cleanup of resource value.
-func (res *Resource[T]) Hijack() {
+func (res *Resource[T]) Hijack(ctx context.Context) {
 	if res.status != resourceStatusAcquired {
 		panic("tried to hijack resource that is not acquired")
 	}
-	res.pool.hijackAcquiredResource(res)
+	res.pool.hijackAcquiredResource(ctx, res)
 }
 
 // CreationTime returns when the resource was created by the pool.
@@ -129,8 +133,9 @@ type Pool[T any] struct {
 	acquireSem *semaphore.Weighted
 	destructWG sync.WaitGroup
 
-	allResources  resList[T]
-	idleResources *genstack.GenStack[*Resource[T]]
+	allResources     resList[T]
+	allResourcesMap  resMap[resList[T]]
+	idleResourcesMap resMap[*genstack.GenStack[*Resource[T]]]
 
 	constructor Constructor[T]
 	destructor  Destructor[T]
@@ -165,7 +170,8 @@ func NewPool[T any](config *Config[T]) (*Pool[T], error) {
 
 	return &Pool[T]{
 		acquireSem:           semaphore.NewWeighted(int64(config.MaxSize)),
-		idleResources:        genstack.NewGenStack[*Resource[T]](),
+		allResourcesMap:      make(resMap[resList[T]]),
+		idleResourcesMap:     make(resMap[*genstack.GenStack[*Resource[T]]]),
 		maxSize:              config.MaxSize,
 		constructor:          config.Constructor,
 		destructor:           config.Destructor,
@@ -176,7 +182,7 @@ func NewPool[T any](config *Config[T]) (*Pool[T], error) {
 
 // Close destroys all resources in the pool and rejects future Acquire calls.
 // Blocks until all resources are returned to pool and destroyed.
-func (p *Pool[T]) Close() {
+func (p *Pool[T]) Close(ctx context.Context) {
 	defer p.destructWG.Wait()
 
 	p.mux.Lock()
@@ -188,9 +194,11 @@ func (p *Pool[T]) Close() {
 	p.closed = true
 	p.cancelBaseAcquireCtx()
 
-	for res, ok := p.idleResources.Pop(); ok; res, ok = p.idleResources.Pop() {
-		p.allResources.remove(res)
-		go p.destructResourceValue(res.value)
+	for _, idleResources := range p.idleResourcesMap {
+		for res, ok := idleResources.Pop(); ok; res, ok = idleResources.Pop() {
+			p.removeResource(ctx, res)
+			go p.destructResourceValue(res.value)
+		}
 	}
 }
 
@@ -299,8 +307,39 @@ func (p *Pool[T]) Stat() *Stat {
 // is empty, this method returns nil and doesn't modify the idleResources slice.
 //
 // WARNING: Caller of this method must hold the pool mutex!
-func (p *Pool[T]) tryAcquireIdleResource() *Resource[T] {
-	res, ok := p.idleResources.Pop()
+func (p *Pool[T]) tryAcquireIdleResource(ctx context.Context) *Resource[T] {
+	key := p.getPoolKey(ctx)
+	idleResources, ok := p.idleResourcesMap[key]
+	// No idle resource found for that key and there are no more resources available
+	// Try to acquire a resource from another key
+	newKey := key
+	if (!ok || idleResources.Len() <= 0) && len(p.allResources) >= int(p.maxSize) {
+		maxCount := 0
+		for k, v := range p.idleResourcesMap {
+			if v.Len() > maxCount {
+				maxCount = v.Len()
+				idleResources = v
+				newKey = k
+			}
+		}
+	}
+	// No idle resource available
+	if idleResources == nil {
+		return nil
+	}
+	// If we selected a resource from another key, we affect the resource to the new key
+	if key != newKey {
+		previousKeyResources := p.allResourcesMap[key]
+		res := previousKeyResources.popBack()
+		p.allResourcesMap[key] = previousKeyResources
+		if allResources, ok := p.allResourcesMap[newKey]; ok {
+			p.allResourcesMap[newKey] = append(allResources, res)
+		} else {
+			p.allResourcesMap[newKey] = resList[T]{res}
+		}
+	}
+
+	res, ok := idleResources.Pop()
 	if !ok {
 		return nil
 	}
@@ -313,7 +352,7 @@ func (p *Pool[T]) tryAcquireIdleResource() *Resource[T] {
 // resources.
 //
 // WARNING: Caller of this method must hold the pool mutex!
-func (p *Pool[T]) createNewResource() *Resource[T] {
+func (p *Pool[T]) createNewResource(ctx context.Context) *Resource[T] {
 	res := &Resource[T]{
 		pool:           p,
 		creationTime:   time.Now(),
@@ -322,10 +361,20 @@ func (p *Pool[T]) createNewResource() *Resource[T] {
 		status:         resourceStatusConstructing,
 	}
 
-	p.allResources.append(res)
+	p.PushResource(ctx, res)
 	p.destructWG.Add(1)
 
 	return res
+}
+
+func (p *Pool[T]) PushResource(ctx context.Context, res *Resource[T]) {
+	p.allResources.append(res)
+	key := p.getPoolKey(ctx)
+	if allResources, ok := p.allResourcesMap[key]; ok {
+		p.allResourcesMap[key] = append(allResources, res)
+	} else {
+		p.allResourcesMap[key] = resList[T]{res}
+	}
 }
 
 // Acquire gets a resource from the pool. If no resources are available and the pool is not at maximum capacity it will
@@ -372,7 +421,7 @@ func (p *Pool[T]) acquire(ctx context.Context) (*Resource[T], error) {
 	}
 
 	// If a resource is available in the pool.
-	if res := p.tryAcquireIdleResource(); res != nil {
+	if res := p.tryAcquireIdleResource(ctx); res != nil {
 		waitTime := time.Duration(nanotime() - startNano)
 		if waitedForLock {
 			p.emptyAcquireCount += 1
@@ -390,7 +439,7 @@ func (p *Pool[T]) acquire(ctx context.Context) (*Resource[T], error) {
 	}
 
 	// The resource is not idle, but there is enough space to create one.
-	res := p.createNewResource()
+	res := p.createNewResource(ctx)
 	p.mux.Unlock()
 
 	res, err := p.initResourceValue(ctx, res)
@@ -410,6 +459,15 @@ func (p *Pool[T]) acquire(ctx context.Context) (*Resource[T], error) {
 	return res, nil
 }
 
+func (p *Pool[T]) getPoolKey(ctx context.Context) string {
+	key := ""
+	keyValue := ctx.Value(PoolKey)
+	if keyValue != nil {
+		key = keyValue.(string)
+	}
+	return key
+}
+
 func (p *Pool[T]) initResourceValue(ctx context.Context, res *Resource[T]) (*Resource[T], error) {
 	// Create the resource in a goroutine to immediately return from Acquire
 	// if ctx is canceled without also canceling the constructor.
@@ -423,12 +481,12 @@ func (p *Pool[T]) initResourceValue(ctx context.Context, res *Resource[T]) (*Res
 		value, err := p.constructor(constructorCtx)
 		if err != nil {
 			p.mux.Lock()
-			p.allResources.remove(res)
+			p.removeResource(ctx, res)
 			p.destructWG.Done()
 
 			// The resource won't be acquired because its
 			// construction failed. We have to allow someone else to
-			// take that resouce.
+			// take that resource.
 			p.acquireSem.Release(1)
 			p.mux.Unlock()
 
@@ -452,7 +510,7 @@ func (p *Pool[T]) initResourceValue(ctx context.Context, res *Resource[T]) (*Res
 		select {
 		case constructErrChan <- nil:
 		case <-ctx.Done():
-			p.releaseAcquiredResource(res, res.lastUsedNano)
+			p.releaseAcquiredResource(ctx, res, res.lastUsedNano)
 		}
 	}()
 
@@ -479,13 +537,15 @@ func (p *Pool[T]) TryAcquire(ctx context.Context) (*Resource[T], error) {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 
+	key := p.getPoolKey(ctx)
+
 	if p.closed {
 		p.acquireSem.Release(1)
 		return nil, ErrClosedPool
 	}
 
 	// If a resource is available now
-	if res := p.tryAcquireIdleResource(); res != nil {
+	if res := p.tryAcquireIdleResource(ctx); res != nil {
 		p.acquireCount += 1
 		return res, nil
 	}
@@ -495,7 +555,7 @@ func (p *Pool[T]) TryAcquire(ctx context.Context) (*Resource[T], error) {
 		panic("bug: semaphore allowed more acquires than pool allows")
 	}
 
-	res := p.createNewResource()
+	res := p.createNewResource(ctx)
 	go func() {
 		value, err := p.constructor(ctx)
 
@@ -514,7 +574,10 @@ func (p *Pool[T]) TryAcquire(ctx context.Context) (*Resource[T], error) {
 
 		res.value = value
 		res.status = resourceStatusIdle
-		p.idleResources.Push(res)
+		if _, ok := p.idleResourcesMap[key]; !ok {
+			p.idleResourcesMap[key] = genstack.NewGenStack[*Resource[T]]()
+		}
+		p.idleResourcesMap[key].Push(res)
 	}()
 
 	return nil, ErrNotAvailable
@@ -569,7 +632,10 @@ func (p *Pool[T]) AcquireAllIdle() []*Resource[T] {
 		return nil
 	}
 
-	numIdle := p.idleResources.Len()
+	numIdle := 0
+	for _, idleResources := range p.idleResourcesMap {
+		numIdle += idleResources.Len()
+	}
 	if numIdle == 0 {
 		return nil
 	}
@@ -587,17 +653,29 @@ func (p *Pool[T]) AcquireAllIdle() []*Resource[T] {
 	acquired := acquireSemAll(p.acquireSem, numIdle)
 
 	idle := make([]*Resource[T], acquired)
-	for i := range idle {
-		res, _ := p.idleResources.Pop()
-		res.status = resourceStatusAcquired
-		idle[i] = res
+	count := 0
+	for _, idleResources := range p.idleResourcesMap {
+		idleResourcesCount := idleResources.Len()
+		for i := 0; i < idleResourcesCount; i++ {
+			if acquired <= count {
+				break
+			}
+			res, _ := idleResources.Pop()
+			res.status = resourceStatusAcquired
+			idle[count] = res
+			count += 1
+		}
+		if acquired <= count {
+			break
+		}
 	}
-
-	// We have to bump the generation to ensure that Acquire/TryAcquire
-	// calls running in parallel (those which caused acquired < numIdle)
-	// will consume old connections and not freshly released connections
-	// instead.
-	p.idleResources.NextGen()
+	for _, idleResources := range p.idleResourcesMap {
+		// We have to bump the generation to ensure that Acquire/TryAcquire
+		// calls running in parallel (those which caused acquired < numIdle)
+		// will consume old connections and not freshly released connections
+		// instead.
+		idleResources.NextGen()
+	}
 
 	return idle
 }
@@ -622,7 +700,7 @@ func (p *Pool[T]) CreateResource(ctx context.Context) error {
 		return ErrNotAvailable
 	}
 
-	res := p.createNewResource()
+	res := p.createNewResource(ctx)
 	p.mux.Unlock()
 
 	value, err := p.constructor(ctx)
@@ -630,7 +708,7 @@ func (p *Pool[T]) CreateResource(ctx context.Context) error {
 	defer p.mux.Unlock()
 	defer p.acquireSem.Release(1)
 	if err != nil {
-		p.allResources.remove(res)
+		p.removeResource(ctx, res)
 		p.destructWG.Done()
 		return err
 	}
@@ -644,9 +722,20 @@ func (p *Pool[T]) CreateResource(ctx context.Context) error {
 		return ErrClosedPool
 	}
 
-	p.idleResources.Push(res)
+	key := p.getPoolKey(ctx)
+	if _, ok := p.idleResourcesMap[key]; !ok {
+		p.idleResourcesMap[key] = genstack.NewGenStack[*Resource[T]]()
+	}
+	p.idleResourcesMap[key].Push(res)
 
 	return nil
+}
+
+func (p *Pool[T]) removeResource(ctx context.Context, res *Resource[T]) {
+	p.allResources.remove(res)
+	if allResources, ok := p.allResourcesMap[p.getPoolKey(ctx)]; ok {
+		allResources.remove(res)
+	}
 }
 
 // Reset destroys all resources, but leaves the pool open. It is intended for use when an error is detected that would
@@ -654,52 +743,60 @@ func (p *Pool[T]) CreateResource(ctx context.Context) error {
 //
 // It is safe to reset a pool while resources are checked out. Those resources will be destroyed when they are returned
 // to the pool.
-func (p *Pool[T]) Reset() {
+func (p *Pool[T]) Reset(ctx context.Context) {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 
 	p.resetCount++
 
-	for res, ok := p.idleResources.Pop(); ok; res, ok = p.idleResources.Pop() {
-		p.allResources.remove(res)
-		go p.destructResourceValue(res.value)
+	for _, idleResources := range p.idleResourcesMap {
+		for res, ok := idleResources.Pop(); ok; res, ok = idleResources.Pop() {
+			p.removeResource(ctx, res)
+			go p.destructResourceValue(res.value)
+		}
 	}
 }
 
 // releaseAcquiredResource returns res to the the pool.
-func (p *Pool[T]) releaseAcquiredResource(res *Resource[T], lastUsedNano int64) {
+func (p *Pool[T]) releaseAcquiredResource(ctx context.Context, res *Resource[T], lastUsedNano int64) {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	defer p.acquireSem.Release(1)
-
+	key := p.getPoolKey(ctx)
 	if p.closed || res.poolResetCount != p.resetCount {
-		p.allResources.remove(res)
+		p.removeResource(ctx, res)
 		go p.destructResourceValue(res.value)
 	} else {
 		res.lastUsedNano = lastUsedNano
 		res.status = resourceStatusIdle
-		p.idleResources.Push(res)
+
+		if _, ok := p.idleResourcesMap[key]; !ok {
+			p.idleResourcesMap[key] = genstack.NewGenStack[*Resource[T]]()
+		}
+		idleResources := p.idleResourcesMap[key]
+		idleResources.Push(res)
+		p.idleResourcesMap[key] = idleResources
 	}
 }
 
 // Remove removes res from the pool and closes it. If res is not part of the
 // pool Remove will panic.
-func (p *Pool[T]) destroyAcquiredResource(res *Resource[T]) {
+func (p *Pool[T]) destroyAcquiredResource(ctx context.Context, res *Resource[T]) {
 	p.destructResourceValue(res.value)
 
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	defer p.acquireSem.Release(1)
 
-	p.allResources.remove(res)
+	p.removeResource(ctx, res)
 }
 
-func (p *Pool[T]) hijackAcquiredResource(res *Resource[T]) {
+func (p *Pool[T]) hijackAcquiredResource(ctx context.Context, res *Resource[T]) {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	defer p.acquireSem.Release(1)
 
-	p.allResources.remove(res)
+	p.removeResource(ctx, res)
 	res.status = resourceStatusHijacked
 	p.destructWG.Done() // not responsible for destructing hijacked resources
 }
